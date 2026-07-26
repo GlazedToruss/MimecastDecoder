@@ -14,6 +14,11 @@ import requests
 CONFIG_FILE = Path.home() / ".mcdecode"
 
 
+class DecodeError(Exception):
+    """Custom exception for URL decoding failures."""
+    pass
+
+
 def parse_cookie_arg(cookie_str: str) -> tuple[str, str]:
     """Parses a cookie string in the format key=value."""
     if "=" not in cookie_str:
@@ -66,8 +71,7 @@ def decode_url(url: str, cookie_key: str, cookie_value: str, debug: bool = False
         # One request to rule them all (automatic redirect following)
         response = requests.get(url, cookies=cookies, allow_redirects=True)
     except requests.RequestException as e:
-        print(f"ERROR: Network request failed: {e}")
-        sys.exit(1)
+        raise DecodeError(f"Network request failed: {e}")
 
     if debug:
         print(f"DEBUG: Final Response URL: {response.url}")
@@ -82,8 +86,7 @@ def decode_url(url: str, cookie_key: str, cookie_value: str, debug: bool = False
 
     # Case 2: We landed on an enrollment page
     if "enrollment" in response.url or "enrollment" in response_text.lower():
-        print("ERROR: URL decode failed. Ensure a valid, enrolled cookie is specified.")
-        sys.exit(1)
+        raise DecodeError("URL decode failed. Ensure a valid, enrolled cookie is specified.")
 
     # Case 3: We landed on a user challenge / email security training page
     # Extract cache key and make API call to fetch original URL
@@ -108,14 +111,12 @@ def decode_url(url: str, cookie_key: str, cookie_value: str, debug: bool = False
         except Exception as e:
             if debug:
                 print(f"DEBUG: API response: {api_response.text if 'api_response' in locals() else 'None'}")
-            print(f"ERROR: Failed to retrieve URL from security challenge API: {e}")
-            sys.exit(1)
+            raise DecodeError(f"Failed to retrieve URL from security challenge API: {e}")
 
     # If all else fails
-    print(f"ERROR: Unexpected response format or page encountered. Final URL: {response.url}")
     if debug:
         print(f"DEBUG: Response body snippet: {response_text[:500]}")
-    sys.exit(1)
+    raise DecodeError(f"Unexpected response format or page encountered. Final URL: {response.url}")
 
 
 def main() -> None:
@@ -127,7 +128,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=program_info)
     parser.add_argument("--cookie", "-c", help="Cookie from an enrolled browser in the format of key=value")
     parser.add_argument("--save", "-s", help="Save the specified cookie in ~/.mcdecode if URL is successfully decoded", action="store_true")
-    parser.add_argument("--url", "-u", help="Encoded URL", required=True)
+    
+    # Mutually exclusive group for URL or File input
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--url", "-u", help="Encoded URL")
+    group.add_argument("--file", "-f", help="File containing multiple encoded URLs (one per line)")
+    
     parser.add_argument("--debug", help="Output debug information", action="store_true")
 
     args = parser.parse_args()
@@ -139,10 +145,41 @@ def main() -> None:
     else:
         cookie_key, cookie_value = load_cookie()
 
-    decoded = decode_url(args.url, cookie_key, cookie_value, args.debug)
-    print(decoded)
+    success = False
+    if args.url:
+        try:
+            decoded = decode_url(args.url, cookie_key, cookie_value, args.debug)
+            print(decoded)
+            success = True
+        except DecodeError as e:
+            print(f"ERROR: {e}")
+            sys.exit(1)
+    else:
+        # File processing
+        if not os.path.exists(args.file):
+            print(f"ERROR: File not found: {args.file}")
+            sys.exit(1)
 
-    if args.save and cookie_given:
+        try:
+            with open(args.file, "r", encoding="utf-8") as f:
+                urls = [line.strip() for line in f if line.strip()]
+        except Exception as e:
+            print(f"ERROR: Failed to read file {args.file}: {e}")
+            sys.exit(1)
+
+        decoded_any = False
+        for url in urls:
+            if url.startswith("#") or not url.startswith("http"):
+                continue  # Skip comments or non-HTTP lines
+            try:
+                decoded = decode_url(url, cookie_key, cookie_value, args.debug)
+                print(decoded)
+                decoded_any = True
+            except DecodeError as e:
+                print(f"ERROR decoding {url}: {e}", file=sys.stderr)
+        success = decoded_any
+
+    if args.save and cookie_given and success:
         if args.debug:
             print(f"DEBUG: Saving cookie to {CONFIG_FILE}")
         save_cookie(cookie_key, cookie_value)
