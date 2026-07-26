@@ -59,6 +59,24 @@ def save_cookie(cookie_key: str, cookie_value: str) -> None:
         print(f"ERROR: Failed to save cookie to {CONFIG_FILE}: {e}")
 
 
+def is_mimecast_url(url: str) -> bool:
+    """Checks if a URL is a Mimecast-encoded URL."""
+    try:
+        parsed = urlparse(url)
+        if not parsed.scheme or not parsed.netloc:
+            return False
+        netloc = parsed.netloc.lower()
+        # Mimecast domains typically include 'mimecastprotect.com' or 'mimecast.com'
+        if "mimecastprotect.com" not in netloc and "mimecast.com" not in netloc:
+            return False
+        # Mimecast protective link paths usually start with /s/ or /t/ or /r/
+        if not parsed.path.startswith(("/s/", "/t/", "/r/")):
+            return False
+        return True
+    except Exception:
+        return False
+
+
 def decode_url(url: str, cookie_key: str, cookie_value: str, debug: bool = False) -> str:
     """Decodes the Mimecast URL using a single HTTP request with auto-redirects."""
     cookies = {cookie_key: cookie_value}
@@ -147,6 +165,11 @@ def main() -> None:
 
     success = False
     if args.url:
+        if not is_mimecast_url(args.url):
+            # Print as-is if it's already a decoded/non-Mimecast URL
+            print(args.url)
+            sys.exit(0)
+            
         try:
             decoded = decode_url(args.url, cookie_key, cookie_value, args.debug)
             print(decoded)
@@ -169,8 +192,8 @@ def main() -> None:
 
         decoded_any = False
         for url in urls:
-            if url.startswith("#") or not url.startswith("http"):
-                continue  # Skip comments or non-HTTP lines
+            if not is_mimecast_url(url):
+                continue  # Skip comments, non-HTTP, normal non-Mimecast URLs
             try:
                 decoded = decode_url(url, cookie_key, cookie_value, args.debug)
                 print(decoded)
