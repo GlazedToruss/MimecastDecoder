@@ -4,8 +4,10 @@ Decodes URLs created by the Mimecast URL Protection feature.
 """
 
 import argparse
+import html
 import json
 import os
+import re
 import sys
 from pathlib import Path
 from urllib.parse import urlparse
@@ -59,6 +61,37 @@ def save_cookie(cookie_key: str, cookie_value: str) -> None:
         print(f"ERROR: Failed to save cookie to {CONFIG_FILE}: {e}")
 
 
+def read_file_content(file_path: str) -> str:
+    """Reads a file trying multiple encodings to handle UTF-8, UTF-16, and legacy text."""
+    encodings = ["utf-16", "utf-8", "windows-1252"]
+    for enc in encodings:
+        try:
+            with open(file_path, "r", encoding=enc) as f:
+                return f.read()
+        except (UnicodeDecodeError, LookupError):
+            continue
+    # Ultimate fallback ignoring error bytes
+    with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+        return f.read()
+
+
+def extract_mimecast_urls_from_html(html_content: str) -> list[str]:
+    """Extracts all unique URLs containing 'mimecast' from HTML content using regex."""
+    # Matches http:// or https:// followed by non-whitespace, non-quotes, non-brackets
+    url_pattern = re.compile(r'https?://[^\s"\'<>]+')
+    unescaped_content = html.unescape(html_content)
+    found_urls = url_pattern.findall(unescaped_content)
+    
+    seen = set()
+    mimecast_urls = []
+    for url in found_urls:
+        if "mimecast" in url.lower():
+            if url not in seen:
+                seen.add(url)
+                mimecast_urls.append(url)
+    return mimecast_urls
+
+
 def is_mimecast_url(url: str) -> bool:
     """Checks if a URL is a Mimecast-encoded URL."""
     try:
@@ -97,7 +130,8 @@ def decode_url(url: str, cookie_key: str, cookie_value: str, debug: bool = False
 
     # Case 1: The response body itself is the decoded URL (common in modern Mimecast)
     response_text = response.text.strip()
-    if response_text.startswith(("http://", "https://")) and "\n" not in response_text:
+    if ("\n" not in response_text and " " not in response_text and 
+            "<" not in response_text and "." in response_text):
         if debug:
             print("DEBUG: Successfully decoded URL directly from response body.")
         return response_text
@@ -184,11 +218,21 @@ def main() -> None:
             sys.exit(1)
 
         try:
-            with open(args.file, "r", encoding="utf-8") as f:
-                urls = [line.strip() for line in f if line.strip()]
+            content = read_file_content(args.file)
         except Exception as e:
             print(f"ERROR: Failed to read file {args.file}: {e}")
             sys.exit(1)
+
+        # Check file extension
+        _, ext = os.path.splitext(args.file.lower())
+        if ext in (".htm", ".html"):
+            if args.debug:
+                print(f"DEBUG: Processing HTML file: {args.file}")
+            urls = extract_mimecast_urls_from_html(content)
+        else:
+            if args.debug:
+                print(f"DEBUG: Processing plain text file: {args.file}")
+            urls = [line.strip() for line in content.splitlines() if line.strip()]
 
         decoded_any = False
         for url in urls:

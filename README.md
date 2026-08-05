@@ -52,10 +52,20 @@ https://github.com/guy-liu/mcdecode
 ``` 
 You can also specify a different cookie (`-c`) as a one-time value for testing, or in combination with the save cookie option (`-s`) to update the stored cookie in the config file. The config file is located at `~/.mcdecode`.
 
-### Batch Mode (Multiple URLs)
-You can also decode multiple URLs listed in a text file. The tool automatically validates and filters incoming entries, only decoding Mimecast-protected URLs and skipping plain links, malformed lines, or garbage strings:
+### Batch Mode & Raw Emails (Multiple URLs / HTML Files)
+You can also process a file specified with `--file` / `-f`. The tool automatically handles its content based on the file extension:
+
+1. **Plain Text Files (`.txt`, etc.)**: Parses the file line-by-line, validating and filtering incoming entries. It only decodes Mimecast-protected URLs while skipping plain links, malformed lines, or garbage strings.
+2. **Raw Email HTML Files (`.htm`, `.html`)**: Parses the entire file, extracts all unique embedded links containing `"mimecast"`, and decodes each of them. This is extremely handy for analyzing direct mail copies from folders like `Resources/` or local archives.
+
+The script automatically detects and supports multiple file encodings gracefully by prioritizing `UTF-16` (handling Byte Order Marks), strict `UTF-8`, and legacy `windows-1252`/ANSI fallback, ensuring that plain text exports or raw email HTML files parse seamlessly without encoding corruption.
+
 ```bash
+# Process links listed in a plain text file:
 $ ./MimecastDecoder.py -f links.txt
+
+# Extract and decode Mimecast links from a raw HTML email file:
+$ ./MimecastDecoder.py -f Resources/mail1.htm
 ```
 
 ### Help Information
