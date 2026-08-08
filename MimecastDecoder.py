@@ -274,6 +274,13 @@ def main() -> None:
 
     success = False
     session = requests.Session()
+    
+    # Configure connection pooling to match the number of workers/threads to avoid bottlenecks
+    pool_size = args.workers if not args.url else 10
+    adapter = requests.adapters.HTTPAdapter(pool_connections=pool_size, pool_maxsize=pool_size)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+
     session.cookies.set(cookie_key, cookie_value)
     session.headers.update({
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
