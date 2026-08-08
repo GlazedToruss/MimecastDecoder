@@ -4,6 +4,7 @@ Decodes URLs created by the Mimecast URL Protection feature.
 """
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import html
 import json
 import os
@@ -110,65 +111,138 @@ def is_mimecast_url(url: str) -> bool:
         return False
 
 
-def decode_url(url: str, cookie_key: str, cookie_value: str, debug: bool = False) -> str:
-    """Decodes the Mimecast URL using a single HTTP request with auto-redirects."""
-    cookies = {cookie_key: cookie_value}
-
-    if debug:
-        print(f"DEBUG: Making GET request to {url}")
-        print(f"DEBUG: Using cookie: {cookie_key}={cookie_value[:15]}...{cookie_value[-15:] if len(cookie_value) > 30 else ''}")
-
+def is_mimecast_domain(url: str) -> bool:
+    """Checks if a URL has a Mimecast domain (netloc)."""
     try:
-        # One request to rule them all (automatic redirect following)
-        response = requests.get(url, cookies=cookies, allow_redirects=True)
-    except requests.RequestException as e:
-        raise DecodeError(f"Network request failed: {e}")
+        parsed = urlparse(url)
+        netloc = parsed.netloc.lower()
+        return "mimecastprotect.com" in netloc or "mimecast.com" in netloc
+    except Exception:
+        return False
 
-    if debug:
-        print(f"DEBUG: Final Response URL: {response.url}")
-        print(f"DEBUG: Final Response Status: {response.status_code}")
 
-    # Case 1: The response body itself is the decoded URL (common in modern Mimecast)
-    response_text = response.text.strip()
-    if ("\n" not in response_text and " " not in response_text and 
-            "<" not in response_text and "." in response_text):
+def defang_url(url: str) -> str:
+    """Converts a URL into a non-clickable defanged format for security."""
+    if not url:
+        return url
+    defanged = url
+    # Replace http/https with hxxp/hxxps
+    defanged = re.sub(r'^https?:', lambda m: m.group(0).lower().replace('http', 'hxxp'), defanged, flags=re.IGNORECASE)
+    
+    # Defang netloc (authority) dots
+    scheme_match = re.match(r'^(hxxps?://)([^/]+)', defanged, flags=re.IGNORECASE)
+    if scheme_match:
+        scheme, domain = scheme_match.groups()
+        defanged_domain = domain.replace('.', '[.]')
+        defanged = scheme + defanged_domain + defanged[scheme_match.end():]
+    else:
+        domain_match = re.match(r'^([^/]+)', defanged)
+        if domain_match:
+            domain = domain_match.group(1)
+            if '.' in domain:
+                defanged_domain = domain.replace('.', '[.]')
+                defanged = defanged_domain + defanged[domain_match.end():]
+    return defanged
+
+
+def decode_url(url: str, cookie_key: str, cookie_value: str, session: requests.Session = None, debug: bool = False) -> str:
+    """Decodes the Mimecast URL using HTTP requests without following non-Mimecast redirects."""
+    cookies = {cookie_key: cookie_value}
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
+    current_url = url
+    max_hops = 5
+
+    for hop in range(max_hops):
         if debug:
-            print("DEBUG: Successfully decoded URL directly from response body.")
-        return response_text
-
-    # Case 2: We landed on an enrollment page
-    if "enrollment" in response.url or "enrollment" in response_text.lower():
-        raise DecodeError("URL decode failed. Ensure a valid, enrolled cookie is specified.")
-
-    # Case 3: We landed on a user challenge / email security training page
-    # Extract cache key and make API call to fetch original URL
-    parsed_url = urlparse(response.url)
-    query_params = dict(q.split("=", 1) for q in parsed_url.query.split("&") if "=" in q)
-    cache_key = query_params.get("key")
-
-    if cache_key:
-        if debug:
-            print(f"DEBUG: Security challenge detected. Extracted cacheKey: {cache_key}")
-            print("DEBUG: Making API call to retrieve original URL.")
-
-        api_url = f"{parsed_url.scheme}://{parsed_url.netloc}/api/ttp/url/get-page-data"
-        payload = {"data": [{"cacheKey": cache_key, "pageType": "user_challenge"}]}
+            print(f"DEBUG: Making GET request to {current_url} (hop {hop + 1})")
+            if hop == 0:
+                print(f"DEBUG: Using cookie: {cookie_key}={cookie_value[:15]}...{cookie_value[-15:] if len(cookie_value) > 30 else ''}")
 
         try:
-            api_response = requests.post(api_url, cookies=cookies, json=payload)
-            api_response.raise_for_status()
-            data = api_response.json()
-            original_url = data["data"][0]["originalUrl"]
-            return original_url
-        except Exception as e:
-            if debug:
-                print(f"DEBUG: API response: {api_response.text if 'api_response' in locals() else 'None'}")
-            raise DecodeError(f"Failed to retrieve URL from security challenge API: {e}")
+            # We set allow_redirects=False to prevent connecting to untrusted destination domains
+            if session:
+                response = session.get(current_url, allow_redirects=False, timeout=10)
+            else:
+                response = requests.get(current_url, cookies=cookies, headers=headers, allow_redirects=False, timeout=10)
+        except requests.RequestException as e:
+            raise DecodeError(f"Network request failed: {e}")
 
-    # If all else fails
-    if debug:
-        print(f"DEBUG: Response body snippet: {response_text[:500]}")
-    raise DecodeError(f"Unexpected response format or page encountered. Final URL: {response.url}")
+        if debug:
+            print(f"DEBUG: Response Status: {response.status_code}")
+            if response.headers.get("Location"):
+                print(f"DEBUG: Redirect Location header: {response.headers['Location']}")
+
+        # Check for 3xx redirect
+        if 300 <= response.status_code < 400 and "Location" in response.headers:
+            redirect_url = response.headers["Location"]
+            if debug:
+                print(f"DEBUG: Encountered redirect to {redirect_url}")
+
+            # If the redirect is to an external untrusted domain, stop and return it immediately!
+            if not is_mimecast_domain(redirect_url):
+                if debug:
+                    print("DEBUG: Redirect target is an external domain. Safely returning it without connecting.")
+                return redirect_url
+
+            # If it is a Mimecast URL, we can follow it safely (it's still on Mimecast's servers)
+            current_url = redirect_url
+            continue
+
+        # If it's a 200 OK (or any other non-redirect), we process the response body
+        response_text = response.text.strip()
+        
+        # Case 1: The response body itself is the decoded URL (common in modern Mimecast)
+        if ("\n" not in response_text and " " not in response_text and 
+                "<" not in response_text and "." in response_text):
+            if debug:
+                print("DEBUG: Successfully decoded URL directly from response body.")
+            return response_text
+
+        # Case 2: We landed on an enrollment page
+        if "enrollment" in response.url or "enrollment" in response_text.lower():
+            raise DecodeError("URL decode failed. Ensure a valid, enrolled cookie is specified.")
+
+        # Case 3: We landed on a user challenge / email security training page
+        # Extract cache key and make API call to fetch original URL
+        cache_key = None
+        for source_url in (current_url, response.url):
+            # Extract key from query string or fragment (hash) using a robust regex search
+            match = re.search(r"[?&]key=([^&/#?]+)", source_url)
+            if match:
+                cache_key = match.group(1)
+                break
+
+        if cache_key:
+            if debug:
+                print(f"DEBUG: Security challenge detected. Extracted cacheKey: {cache_key}")
+                print("DEBUG: Making API call to retrieve original URL.")
+
+            parsed_url = urlparse(current_url)
+            api_url = f"{parsed_url.scheme}://{parsed_url.netloc}/api/ttp/url/get-page-data"
+            payload = {"data": [{"cacheKey": cache_key, "pageType": "user_challenge"}]}
+
+            try:
+                if session:
+                    api_response = session.post(api_url, json=payload, allow_redirects=False, timeout=10)
+                else:
+                    api_response = requests.post(api_url, cookies=cookies, headers=headers, json=payload, allow_redirects=False, timeout=10)
+                api_response.raise_for_status()
+                data = api_response.json()
+                original_url = data["data"][0]["originalUrl"]
+                return original_url
+            except Exception as e:
+                if debug:
+                    print(f"DEBUG: API response: {api_response.text if 'api_response' in locals() else 'None'}")
+                raise DecodeError(f"Failed to retrieve URL from security challenge API: {e}")
+
+        # If all else fails
+        if debug:
+            print(f"DEBUG: Response body snippet: {response_text[:500]}")
+        raise DecodeError(f"Unexpected response format or page encountered. Status: {response.status_code}")
+
+    raise DecodeError("Exceeded maximum redirects while resolving Mimecast URL.")
 
 
 def main() -> None:
@@ -186,6 +260,7 @@ def main() -> None:
     group.add_argument("--url", "-u", help="Encoded URL")
     group.add_argument("--file", "-f", help="File containing multiple encoded URLs (one per line)")
     
+    parser.add_argument("--workers", "-w", type=int, default=10, help="Number of concurrent workers for batch processing (default: 10)")
     parser.add_argument("--debug", help="Output debug information", action="store_true")
 
     args = parser.parse_args()
@@ -198,53 +273,75 @@ def main() -> None:
         cookie_key, cookie_value = load_cookie()
 
     success = False
-    if args.url:
-        if not is_mimecast_url(args.url):
-            # Print as-is if it's already a decoded/non-Mimecast URL
-            print(args.url)
-            sys.exit(0)
-            
-        try:
-            decoded = decode_url(args.url, cookie_key, cookie_value, args.debug)
-            print(decoded)
-            success = True
-        except DecodeError as e:
-            print(f"ERROR: {e}")
-            sys.exit(1)
-    else:
-        # File processing
-        if not os.path.exists(args.file):
-            print(f"ERROR: File not found: {args.file}")
-            sys.exit(1)
+    session = requests.Session()
+    session.cookies.set(cookie_key, cookie_value)
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    })
 
-        try:
-            content = read_file_content(args.file)
-        except Exception as e:
-            print(f"ERROR: Failed to read file {args.file}: {e}")
-            sys.exit(1)
-
-        # Check file extension
-        _, ext = os.path.splitext(args.file.lower())
-        if ext in (".htm", ".html"):
-            if args.debug:
-                print(f"DEBUG: Processing HTML file: {args.file}")
-            urls = extract_mimecast_urls_from_html(content)
-        else:
-            if args.debug:
-                print(f"DEBUG: Processing plain text file: {args.file}")
-            urls = [line.strip() for line in content.splitlines() if line.strip()]
-
-        decoded_any = False
-        for url in urls:
-            if not is_mimecast_url(url):
-                continue  # Skip comments, non-HTTP, normal non-Mimecast URLs
+    with session:
+        if args.url:
+            if not is_mimecast_url(args.url):
+                # Print as-is if it's already a decoded/non-Mimecast URL
+                print(defang_url(args.url))
+                sys.exit(0)
+                
             try:
-                decoded = decode_url(url, cookie_key, cookie_value, args.debug)
-                print(decoded)
-                decoded_any = True
+                decoded = decode_url(args.url, cookie_key, cookie_value, session=session, debug=args.debug)
+                print(defang_url(decoded))
+                success = True
             except DecodeError as e:
-                print(f"ERROR decoding {url}: {e}", file=sys.stderr)
-        success = decoded_any
+                print(f"ERROR: {e}")
+                sys.exit(1)
+        else:
+            # File processing
+            if not os.path.exists(args.file):
+                print(f"ERROR: File not found: {args.file}")
+                sys.exit(1)
+
+            try:
+                content = read_file_content(args.file)
+            except Exception as e:
+                print(f"ERROR: Failed to read file {args.file}: {e}")
+                sys.exit(1)
+
+            # Check file extension
+            _, ext = os.path.splitext(args.file.lower())
+            if ext in (".htm", ".html"):
+                if args.debug:
+                    print(f"DEBUG: Processing HTML file: {args.file}")
+                urls = extract_mimecast_urls_from_html(content)
+            else:
+                if args.debug:
+                    print(f"DEBUG: Processing plain text file: {args.file}")
+                urls = [line.strip() for line in content.splitlines() if line.strip()]
+
+            mimecast_urls = [url for url in urls if is_mimecast_url(url)]
+
+            if not mimecast_urls:
+                success = False
+            else:
+                def process_url(url: str):
+                    try:
+                        decoded = decode_url(url, cookie_key, cookie_value, session=session, debug=args.debug)
+                        return url, defang_url(decoded), None
+                    except DecodeError as e:
+                        return url, None, str(e)
+
+                decoded_any = False
+                if args.debug:
+                    print(f"DEBUG: Spawning ThreadPoolExecutor with {args.workers} workers...")
+                
+                with ThreadPoolExecutor(max_workers=args.workers) as executor:
+                    results = executor.map(process_url, mimecast_urls)
+                    
+                    for url, decoded, error in results:
+                        if decoded:
+                            print(decoded)
+                            decoded_any = True
+                        else:
+                            print(f"ERROR decoding {url}: {error}", file=sys.stderr)
+                success = decoded_any
 
     if args.save and cookie_given and success:
         if args.debug:
